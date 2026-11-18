@@ -1,0 +1,63 @@
+# A version tag (v1.2.3) builds the plugin and makes a GitHub release with
+# the .CVP and the screenshots attached: what the plugin registry reads.
+# The tag is v and the VERSION in CMakeLists.txt, as in v1.2.3.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write           # to make the release
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Tools (Arm GCC 9.2.1, pico-sdk 2.1.1, picotool, sjasmplus)
+        run: tools/ci/setup.sh
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPICO_SDK_PATH="$HOME/pico-sdk"
+          ninja -C build
+
+      - name: The plugin file, and its version against the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -- build/*.CVP
+          if [ "$#" != 1 ] || [ ! -f "$1" ]; then echo "::error::the build should make one .CVP, and made: $*"; exit 1; fi
+          python3 tools/ci/cvpinfo.py "$1"
+          version=$(python3 tools/ci/cvpinfo.py "$1" --version)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::the tag is $TAG but the plugin says version $version: change VERSION in CMakeLists.txt, or the tag"
+            exit 1
+          fi
+          echo "CVP=$1" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Screenshots (256x192, 100 KB at most, up to 3)
+        run: |
+          shots=""
+          for n in 1 2 3; do
+            f=screenshots/screenshot-$n.png
+            if [ -f "$f" ]; then python3 tools/png256.py check "$f"; shots="$shots $f"; fi
+          done
+          [ -n "$shots" ] || echo "::warning::no screenshots/screenshot-1.png: the registry will show none"
+          echo "SHOTS=$shots" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum "$CVP"
+          if [ -f RELEASE_NOTES.md ]; then notes="--notes-file RELEASE_NOTES.md"; else notes="--generate-notes"; fi
+          # shellcheck disable=SC2086
+          gh release create "$TAG" "$CVP" $SHOTS --verify-tag --title "$TAG" $notes

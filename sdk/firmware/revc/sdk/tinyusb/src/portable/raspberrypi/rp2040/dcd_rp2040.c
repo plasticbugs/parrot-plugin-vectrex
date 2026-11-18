@@ -1,0 +1,743 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ * SPDX-FileCopyrightText: Copyright (c) 2020 Ha Thach (tinyusb.org)
+ * SPDX-License-Identifier: MIT
+ *
+ * This file is part of the TinyUSB stack.
+ */
+
+#include "tusb_option.h"
+
+#if CFG_TUD_ENABLED && (CFG_TUSB_MCU == OPT_MCU_RP2040) && !CFG_TUD_RPI_PIO_USB
+
+#include "pico.h"
+#include "hardware/sync.h"
+#include "rp2040_usb.h"
+
+#if TUD_OPT_RP2040_USB_DEVICE_ENUMERATION_FIX
+#include "pico/fix/rp2040_usb_device_enumeration.h"
+#endif
+
+#include "device/dcd.h"
+
+// Current implementation force vbus detection as always present, causing device think it is always plugged into host.
+// Therefore, it cannot detect disconnect event, mistaken it as suspend.
+// Note: won't work if change to 0 (for now)
+  #define FORCE_VBUS_DETECT 1
+
+  #define USB_INTS_ERROR_BITS                                                                 \
+    (USB_INTS_ERROR_DATA_SEQ_BITS | USB_INTS_ERROR_BIT_STUFF_BITS | USB_INTS_ERROR_CRC_BITS | \
+     USB_INTS_ERROR_RX_OVERFLOW_BITS | USB_INTS_ERROR_RX_TIMEOUT_BITS)
+
+/*------------------------------------------------------------------*/
+/* Low level controller
+ *------------------------------------------------------------------*/
+// HW buffer pointer from USB buffer space (max 3840 bytes)
+static uint8_t *hw_buffer_ptr;
+
+// USB_MAX_ENDPOINTS Endpoints, direction TUSB_DIR_OUT for out and TUSB_DIR_IN for in.
+static struct hw_endpoint hw_endpoints[USB_MAX_ENDPOINTS][2];
+
+// SOF may be used by remote wakeup as RESUME, this indicates whether SOF is actually used by usbd
+static bool _sof_enable = false;
+
+TU_ATTR_ALWAYS_INLINE static inline hw_endpoint_t *hw_endpoint_get(uint8_t epnum, tusb_dir_t dir) {
+  return &hw_endpoints[epnum][dir];
+}
+
+TU_ATTR_ALWAYS_INLINE static inline hw_endpoint_t *hw_endpoint_get_by_addr(uint8_t ep_addr) {
+  const uint8_t    num = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir = tu_edpt_dir(ep_addr);
+  return hw_endpoint_get(num, dir);
+}
+
+TU_ATTR_ALWAYS_INLINE static inline io_rw_32 *get_ep_ctrl(uint8_t epnum, tusb_dir_t dir) {
+  if (epnum == 0) {
+    // EP0 has no endpoint control register because the buffer offsets are fixed and always enabled
+    return NULL;
+  }
+  struct usb_device_dpram_ep_ctrl *ep_ctrl = &usb_dpram->ep_ctrl[epnum - 1];
+  return (dir == TUSB_DIR_IN) ? &ep_ctrl->in : &ep_ctrl->out;
+}
+
+TU_ATTR_ALWAYS_INLINE static inline io_rw_32 *get_buf_ctrl(uint8_t epnum, tusb_dir_t dir) {
+  struct usb_device_dpram_ep_buf_ctrl *buf_ctrl = &usb_dpram->ep_buf_ctrl[epnum];
+  return (dir == TUSB_DIR_IN) ? &buf_ctrl->in : &buf_ctrl->out;
+}
+
+// DPRAM an endpoint takes: whole 64-byte blocks, two buffers for bulk
+static uint16_t hw_endpoint_dpram_size(uint16_t wMaxPacketSize, uint8_t transfer_type) {
+  const uint16_t size = (uint16_t)tu_round_up(wMaxPacketSize, 64);
+  return (transfer_type == TUSB_XFER_BULK) ? (uint16_t)(size * 2u) : size;
+}
+
+// Init and enable endpoint
+static void hw_endpoint_open(uint8_t ep_addr, uint16_t wMaxPacketSize, uint8_t transfer_type, bool ep_enabled) {
+  const uint8_t    epnum = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir   = tu_edpt_dir(ep_addr);
+
+  hw_endpoint_t *ep   = hw_endpoint_get(epnum, dir);
+  ep->ep_addr         = ep_addr;
+  ep->next_pid        = 0u;
+  ep->max_packet_size = wMaxPacketSize;
+
+  // Clear existing buffer control state
+  io_rw_32 *buf_reg = get_buf_ctrl(epnum, dir);
+  *buf_reg          = 0;
+
+  // allocated hw buffer
+  if (epnum == 0) {
+    // Buffer offset is fixed (2 buffer allocated).
+    // Note: Only single buffer for EP since Double buffered RX can be troublesome with future data.
+    ep->dpram_buf = (uint8_t *)&usb_dpram->ep0_buf_a[0];
+  } else {
+    io_rw_32      *ep_reg  = get_ep_ctrl(epnum, dir);
+    uint32_t       ep_ctrl = EP_CTRL_INTERRUPT_PER_BUFFER | ((uint32_t)transfer_type << EP_CTRL_BUFFER_TYPE_LSB);
+    const uint16_t size    = hw_endpoint_dpram_size(wMaxPacketSize, transfer_type);
+
+    // double buffered Bulk endpoint
+  #if CFG_TUSB_RP2_ERRATA_E15
+    if (transfer_type == TUSB_XFER_BULK && dir == TUSB_DIR_IN) {
+      ep->e15_bulk_in = true;
+    }
+  #endif
+
+    // A class may open an endpoint again without closing it (video bulk on every SET_INTERFACE): keep its
+    // buffer while it fits, or each open takes new DPRAM until the check below fails. Compare against what was
+    // allocated, not what the last open needed: a smaller open in between must not shrink the retained capacity.
+    if (ep->dpram_buf == NULL || size > ep->dpram_blocks * 64u) {
+      ep->dpram_buf    = hw_buffer_ptr;
+      ep->dpram_blocks = (uint8_t)(size / 64u);
+      hw_buffer_ptr += size;
+    }
+
+    ep_ctrl |= hw_data_offset(ep->dpram_buf);
+    if (ep_enabled) {
+      ep_ctrl |= EP_CTRL_ENABLE_BITS;
+    }
+
+    *ep_reg = ep_ctrl;
+
+    hard_assert(hw_buffer_ptr <= usb_dpram->epx_data + sizeof(usb_dpram->epx_data));
+    pico_info("  Allocated %d bytes (0x%p)\r\n", size, ep->dpram_buf);
+  }
+}
+
+// EP_ABORT makes the controller ignore the endpoint's buffer control and NAK every access; EP_ABORT_DONE reports the
+// endpoint idle, after which no transaction on it can complete. A completion before that leaves its BUFF_STATUS bit set.
+// Due to Errata RP2040-E2: ABORT flag is only applicable for B2 and later (unusable for B0, B1).
+// Which means we are not guaranteed to safely abort pending transfer on B0 and B1.
+static void hw_endpoint_abort_begin(uint32_t abort_mask) {
+  if (rp2040_chip_version() >= 2) {
+    usb_hw_set->abort = abort_mask;
+    while ((usb_hw->abort_done & abort_mask) != abort_mask) {}
+  }
+}
+
+static void hw_endpoint_abort_end(uint32_t abort_mask) {
+  if (rp2040_chip_version() >= 2) {
+    usb_hw_clear->abort_done = abort_mask;
+    usb_hw_clear->abort = abort_mask;
+  }
+}
+
+static void hw_endpoint_abort_xfer(struct hw_endpoint* ep) {
+  // Abort any pending transfer
+  const uint8_t  dir        = (uint8_t)tu_edpt_dir(ep->ep_addr);
+  const uint8_t  epnum      = tu_edpt_number(ep->ep_addr);
+  const uint32_t abort_mask = rp2usb_ep_bit(ep->ep_addr);
+
+  hw_endpoint_abort_begin(abort_mask);
+
+  io_rw_32 *buf_reg = get_buf_ctrl(epnum, dir);
+  *buf_reg          = 0; // clear buffer control
+  rp2usb_reset_transfer(ep);
+
+  hw_endpoint_abort_end(abort_mask);
+}
+
+// Drop the transfer of an endpoint that isn't stalled, if it has one (dcd_edpt_abort_xfer(), or dcd_edpt_xfer() arming
+// a new one over it): abort it, and discard its buffers and any completion still pending in BUFF_STATUS. Each armed
+// buffer advanced the data toggle, so rewind it by the buffers still available once the endpoint is stopped, which the
+// host never saw: the next transfer starts with the toggle the host expects. Interrupts are off, as in
+// dcd_edpt_clear_stall(), so neither the E15 SOF arming nor the ISR touches the endpoint meanwhile.
+static void hw_endpoint_drop_xfer(struct hw_endpoint *ep, io_rw_32 *buf_reg) {
+  const uint32_t ep_bit    = rp2usb_ep_bit(ep->ep_addr);
+  const uint32_t irq_state = save_and_disable_interrupts();
+
+  if (ep->state != EPSTATE_IDLE) { // the ISR may have completed it since the caller looked
+    hw_endpoint_abort_begin(ep_bit);
+    const uint32_t buf_ctrl = *buf_reg;
+    if (buf_ctrl & USB_BUF_CTRL_AVAIL) {
+      ep->next_pid ^= 1u;
+    }
+    if ((buf_ctrl >> 16) & USB_BUF_CTRL_AVAIL) {
+      ep->next_pid ^= 1u;
+    }
+    *buf_reg = 0;
+    while (usb_hw->buf_status & ep_bit) { // double-buffered re-sets the bit after a clear
+      usb_hw_clear->buf_status = ep_bit;
+    }
+    rp2usb_reset_transfer(ep);
+    hw_endpoint_abort_end(ep_bit);
+  }
+
+  restore_interrupts(irq_state);
+}
+
+static void __tusb_irq_path_func(handle_hw_buff_status)(void) {
+  uint32_t buf_status = usb_hw->buf_status;
+  pico_trace("buf_status = 0x%08lx\r\n", buf_status);
+  while (buf_status) {
+    // ctz/clz is faster than loop which has only a few bit set in general
+    const uint8_t i = (uint8_t) __builtin_ctz(buf_status);
+    const uint32_t bit = TU_BIT(i);
+
+    // IN transfer for even i, OUT transfer for odd i
+    const uint8_t    epnum   = i >> 1u;
+    const tusb_dir_t dir     = (i & 1u) ? TUSB_DIR_OUT : TUSB_DIR_IN;
+    hw_endpoint_t   *ep      = hw_endpoint_get(epnum, dir);
+    io_rw_32        *ep_reg  = get_ep_ctrl(epnum, dir);
+    io_rw_32        *buf_reg = get_buf_ctrl(epnum, dir);
+
+    // Drop the bit from the snapshot before looking at the hardware: an earlier completion's callback (a class
+    // xfer_isr) may have aborted or replaced this endpoint's transfer, and hw_endpoint_drop_xfer() then cleared its
+    // BUFF_STATUS bit, which would otherwise stay in the snapshot forever and spin this loop.
+    buf_status &= ~bit;
+
+    // Double-buffered: if both buffers completed at once, buf_status re-sets
+    // immediately after clearing (datasheet Table 406). Process the second buffer too.
+    while (usb_hw->buf_status & bit) {
+      const uint8_t buf_id     = (usb_hw->buf_cpu_should_handle & bit) ? 1 : 0; // before clear buf_status
+      usb_hw_clear->buf_status = bit;
+
+      if (rp2usb_xfer_continue(ep, ep_reg, buf_reg, buf_id, dir == TUSB_DIR_OUT)) {
+        const uint16_t xferred_len = ep->xferred_len;
+        rp2usb_reset_transfer(ep);
+        dcd_event_xfer_complete(0, ep->ep_addr, xferred_len, XFER_RESULT_SUCCESS, true);
+      }
+    }
+  }
+}
+
+TU_ATTR_ALWAYS_INLINE static inline void reset_ep0(void) {
+  // If we have finished this transfer on EP0 set pid back to 1 for next
+  // setup transfer. Also clear a stall in case
+  for (uint8_t dir = 0; dir < 2; dir++) {
+    struct hw_endpoint *ep = hw_endpoint_get(0, dir);
+    ep->next_pid = 1u;
+    if (ep->state == EPSTATE_ACTIVE) {
+      hw_endpoint_abort_xfer(ep); // Abort any pending transfer per USB specs
+    }
+  }
+}
+
+static void __tusb_irq_path_func(reset_non_control_endpoints)(void) {
+  // Disable all non-control
+  for (uint8_t i = 0; i < USB_MAX_ENDPOINTS - 1; i++) {
+    usb_dpram->ep_ctrl[i].in = 0;
+    usb_dpram->ep_ctrl[i].out = 0;
+  }
+
+  // clear non-control hw endpoints
+  tu_memclr(hw_endpoints[1], sizeof(hw_endpoints) - 2 * sizeof(hw_endpoint_t));
+
+  // reclaim buffer space
+  hw_buffer_ptr = &usb_dpram->epx_data[0];
+}
+
+// the SDK registers this as the ISR, so it records its own span; under tud_int_handler() the depth counter keeps one
+static void __tusb_irq_path_func(dcd_rp2040_irq)(void) {
+  const uint32_t status  = usb_hw->ints;
+  uint32_t sof_count = 0;
+
+  if (status & USB_INTF_DEV_SOF_BITS) {
+    sof_count = usb_hw->sof_rd & USB_SOF_RD_BITS; // clear interrupt by reading SOF_RD
+
+  #if CFG_TUSB_RP2_ERRATA_E15
+    e15_last_sof = time_us_32();                  // timing critical: before the SystemView record below
+  #endif
+  }
+
+  if (TUD_SYSVIEW_ISR_TRACED) { TU_SYSVIEW_ISR_ENTER(); }
+
+  if (status & USB_INTF_DEV_SOF_BITS) {
+    dcd_event_sof(0, sof_count, true);
+  }
+
+  // xfer events are handled before setup req. So if a transfer completes immediately
+  // before closing the EP, the events will be delivered in same order.
+  if (status & USB_INTS_BUFF_STATUS_BITS) {
+    handle_hw_buff_status();
+  }
+
+  if (status & USB_INTS_SETUP_REQ_BITS) {
+    const uint8_t *setup = remove_volatile_cast(const uint8_t *, &usb_dpram->setup_packet);
+
+    // reset pid to both 1 (data and ack)
+    reset_ep0();
+
+    // Pass setup packet to tiny usb
+    dcd_event_setup_received(0, setup, true);
+    usb_hw_clear->sie_status = USB_SIE_STATUS_SETUP_REC_BITS;
+  }
+
+  // Errata 15 workaround for Device Bulk-In endpoint, must be after BUF_STATUS interrupt to sync buf control first
+  if (status & USB_INTF_DEV_SOF_BITS) {
+    bool keep_sof_alive = false;
+
+  #if CFG_TUSB_RP2_ERRATA_E15
+    for (uint8_t i = 0; i < USB_MAX_ENDPOINTS; i++) {
+      struct hw_endpoint *ep = hw_endpoint_get(i, TUSB_DIR_IN);
+
+      // Active Bulk IN endpoint requires SOF
+      if (ep->e15_bulk_in && ep->state >= EPSTATE_ACTIVE) {
+        keep_sof_alive = true;
+        hw_endpoint_lock_update(ep, 1);
+
+        // Arm only the buffers whose completion has been handled (e15_idle): a buffer the controller has sent but whose
+        // BUFF_STATUS is still pending also reads idle in buffer control, and arming it would hand that completion the
+        // new data. The other buffer, if still in flight, is re-armed by its own completion.
+        const uint8_t idle = ep->e15_idle;
+        if (ep->state == EPSTATE_PENDING && idle) {
+          ep->state    = EPSTATE_ACTIVE;
+          ep->e15_idle = 0;
+
+          io_rw_32 *buf_reg32 = get_buf_ctrl(i, TUSB_DIR_IN);
+          if (idle == 3) {
+            // both are idle, start fresh
+            // this also resets the buffer selector for a deferred ZLP
+            io_rw_32 *ep_reg = get_ep_ctrl(i, TUSB_DIR_IN);
+            rp2usb_buffer_start(ep, ep_reg, buf_reg32, false);
+          } else {
+            // Use 16-bit writes to avoid clobbering the other half (DPSRAM concurrent access).
+            const uint8_t buf_id = idle >> 1;
+            uint16_t buf_ctrl16 = bufctrl_prepare16(ep, ep->dpram_buf + 64 * buf_id, false);
+            bufctrl_write16((io_rw_16 *)buf_reg32 + buf_id, buf_ctrl16);
+          }
+        }
+
+        hw_endpoint_lock_update(ep, -1);
+      }
+    }
+  #endif
+
+    // disable SOF interrupt if it is used for RESUME in remote wakeup
+    if (!keep_sof_alive && !_sof_enable) {
+      usb_hw_clear->inte = USB_INTS_DEV_SOF_BITS;
+    }
+  }
+
+  #if FORCE_VBUS_DETECT == 0
+  // Since we force VBUS detect On, device will always think it is connected and
+  // couldn't distinguish between disconnect and suspend
+  if (status & USB_INTS_DEV_CONN_DIS_BITS) {
+    if (usb_hw->sie_status & USB_SIE_STATUS_CONNECTED_BITS) {
+      // Connected: nothing to do
+    } else {
+      // Disconnected
+      dcd_event_bus_signal(0, DCD_EVENT_UNPLUGGED, true);
+    }
+    usb_hw_clear->sie_status = USB_SIE_STATUS_CONNECTED_BITS;
+  }
+#endif
+
+  // SE0 for 2.5 us or more (will last at least 10ms)
+  if (status & USB_INTS_BUS_RESET_BITS) {
+    pico_trace("BUS RESET\r\n");
+    usb_hw->dev_addr_ctrl = 0;
+    reset_non_control_endpoints();
+    dcd_event_bus_reset(0, TUSB_SPEED_FULL, true);
+    usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
+
+  #if TUD_OPT_RP2040_USB_DEVICE_ENUMERATION_FIX
+    // Only run enumeration workaround if pull up is enabled
+    if (usb_hw->sie_ctrl & USB_SIE_CTRL_PULLUP_EN_BITS) {
+      rp2040_usb_device_enumeration_fix();
+    }
+  #endif
+  }
+
+  /* Note from pico datasheet 4.1.2.6.4 (v1.2)
+   * If you enable the suspend interrupt, it is likely you will see a suspend interrupt when
+   * the device is first connected but the bus is idle. The bus can be idle for a few ms before
+   * the host begins sending start of frame packets. You will also see a suspend interrupt
+   * when the device is disconnected if you do not have a VBUS detect circuit connected. This is
+   * because without VBUS detection, it is impossible to tell the difference between
+   * being disconnected and suspended.
+   */
+  if (status & USB_INTS_DEV_SUSPEND_BITS) {
+    dcd_event_bus_signal(0, DCD_EVENT_SUSPEND, true);
+    usb_hw_clear->sie_status = USB_SIE_STATUS_SUSPENDED_BITS;
+  }
+
+  if (status & USB_INTS_DEV_RESUME_FROM_HOST_BITS) {
+    dcd_event_bus_signal(0, DCD_EVENT_RESUME, true);
+    usb_hw_clear->sie_status = USB_SIE_STATUS_RESUME_BITS;
+  }
+
+  if (TUD_SYSVIEW_ISR_TRACED) { TU_SYSVIEW_ISR_EXIT(); }
+}
+
+/*------------------------------------------------------------------*/
+/* Controller API
+ *------------------------------------------------------------------*/
+
+// older SDK
+#ifndef PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY
+#define PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY 0xff
+#endif
+
+bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
+  (void) rh_init;
+  assert(rhport == 0);
+
+  // TU_LOG(1, "Chip Version B%u\r\n", rp2040_chip_version());
+
+  // A warm restart (SWD flash, debugger reset) keeps the previous image's pull-up: sample it before
+  // rp2usb_init() resets USBCTRL
+  const bool was_attached = (resets_hw->reset_done & RESETS_RESET_USBCTRL_BITS) &&
+                            (usb_hw->sie_ctrl & USB_SIE_CTRL_PULLUP_EN_BITS);
+
+  // Reset hardware to default state
+  rp2usb_init();
+
+  // hold the pull-up off 2 ms so the host sees a detach even behind a max-size full-speed packet
+  // (USB 2.0 7.1.7.3 needs undriven SE0)
+  if (was_attached) {
+    busy_wait_us(2000);
+  }
+
+  #if FORCE_VBUS_DETECT
+  // Force VBUS detect so the device thinks it is plugged into a host
+  usb_hw->pwr = USB_USB_PWR_VBUS_DETECT_BITS | USB_USB_PWR_VBUS_DETECT_OVERRIDE_EN_BITS;
+#endif
+
+  irq_add_shared_handler(USBCTRL_IRQ, dcd_rp2040_irq, PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY);
+
+  // Init control endpoints
+  tu_memclr(hw_endpoints[0], 2 * sizeof(hw_endpoint_t));
+  hw_endpoint_open(0x0, 64, TUSB_XFER_CONTROL, false);
+  hw_endpoint_open(0x80, 64, TUSB_XFER_CONTROL, false);
+
+  // Init non-control endpoints
+  reset_non_control_endpoints();
+
+  // Initializes the USB peripheral for device mode and enables it.
+  // Don't need to enable the pull up here. Force VBUS
+  usb_hw->main_ctrl = USB_MAIN_CTRL_CONTROLLER_EN_BITS;
+
+  // Enable individual controller IRQS here. Processor interrupt enable will be used
+  // for the global interrupt enable...
+  // Note: Force VBUS detect cause disconnection not detectable
+  usb_hw->sie_ctrl = USB_SIE_CTRL_EP0_INT_1BUF_BITS;
+  usb_hw->inte = USB_INTS_BUFF_STATUS_BITS | USB_INTS_BUS_RESET_BITS | USB_INTS_SETUP_REQ_BITS |
+                 USB_INTS_DEV_SUSPEND_BITS | USB_INTS_DEV_RESUME_FROM_HOST_BITS |
+                 (FORCE_VBUS_DETECT ? 0 : USB_INTS_DEV_CONN_DIS_BITS);
+
+  dcd_connect(rhport);
+  return true;
+}
+
+bool dcd_deinit(uint8_t rhport) {
+  (void) rhport;
+
+  reset_non_control_endpoints();
+  irq_remove_handler(USBCTRL_IRQ, dcd_rp2040_irq);
+
+  // reset usb hardware into initial state
+  reset_block(RESETS_RESET_USBCTRL_BITS);
+  unreset_block_wait(RESETS_RESET_USBCTRL_BITS);
+
+  // Release allocated resources
+  rp2usb_deinit();
+
+  return true;
+}
+
+void dcd_int_enable(__unused uint8_t rhport) {
+  assert(rhport == 0);
+  irq_set_enabled(USBCTRL_IRQ, true);
+}
+
+void dcd_int_disable(__unused uint8_t rhport) {
+  assert(rhport == 0);
+  irq_set_enabled(USBCTRL_IRQ, false);
+}
+
+void dcd_set_address(uint8_t rhport, uint8_t dev_addr) {
+  (void)dev_addr;
+  // Can't set device address in hardware until status xfer has complete
+  // Send 0len complete response on EP0 IN
+  dcd_edpt_xfer(rhport, 0x80, NULL, 0, false);
+}
+
+void dcd_remote_wakeup(__unused uint8_t rhport) {
+  pico_info("dcd_remote_wakeup %d\n", rhport);
+  assert(rhport == 0);
+
+  // since RESUME interrupt is not triggered if we are the one initiate
+  // briefly enable SOF to notify usbd when bus is ready
+  usb_hw_set->inte = USB_INTS_DEV_SOF_BITS;
+  usb_hw_set->sie_ctrl = USB_SIE_CTRL_RESUME_BITS;
+}
+
+// disconnect by disabling internal pull-up resistor on D+/D-
+void dcd_disconnect(__unused uint8_t rhport) {
+  (void) rhport;
+  usb_hw_clear->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+}
+
+// connect by enabling internal pull-up resistor on D+/D-
+void dcd_connect(__unused uint8_t rhport) {
+  (void) rhport;
+  usb_hw_set->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
+}
+
+void dcd_sof_enable(uint8_t rhport, bool en) {
+  (void) rhport;
+
+  _sof_enable = en;
+
+  if (en) {
+    usb_hw_set->inte = USB_INTS_DEV_SOF_BITS;
+  }
+  #if !CFG_TUSB_RP2_ERRATA_E15
+  else {
+    // Don't clear immediately if the SOF workaround is in use.
+    // The SOF handler will conditionally disable the interrupt.
+    usb_hw_clear->inte = USB_INTS_DEV_SOF_BITS;
+  }
+#endif
+}
+
+/*------------------------------------------------------------------*/
+/* DCD Endpoint port
+ *------------------------------------------------------------------*/
+void dcd_edpt0_status_complete(uint8_t rhport, tusb_control_request_t const* request) {
+  (void) rhport;
+
+  if (request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE &&
+      request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD &&
+      request->bRequest == TUSB_REQ_SET_ADDRESS) {
+    usb_hw->dev_addr_ctrl = (uint8_t) request->wValue;
+  }
+}
+
+bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const* desc_edpt) {
+  (void) rhport;
+  const uint8_t xfer_type = desc_edpt->bmAttributes.xfer;
+  hw_endpoint_open(desc_edpt->bEndpointAddress, tu_edpt_packet_size(desc_edpt), xfer_type, true);
+  return true;
+}
+
+// New API: Allocate packet buffer used by ISO endpoints
+// Some MCU need manual packet buffer allocation, we allocate the largest size to avoid clustering
+bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet_size) {
+  (void)rhport;
+  hw_endpoint_open(ep_addr, largest_packet_size, TUSB_XFER_ISOCHRONOUS, false);
+  return true;
+}
+
+// New API: Configure and enable an ISO endpoint according to descriptor
+bool dcd_edpt_iso_activate(uint8_t rhport, const tusb_desc_endpoint_t *ep_desc) {
+  (void)rhport;
+  const uint8_t       epnum = tu_edpt_number(ep_desc->bEndpointAddress);
+  const tusb_dir_t    dir   = tu_edpt_dir(ep_desc->bEndpointAddress);
+  struct hw_endpoint *ep    = hw_endpoint_get(epnum, dir);
+  TU_ASSERT(ep->dpram_buf != NULL); // must be inited and allocated previously
+
+  if (ep->state == EPSTATE_ACTIVE) {
+    hw_endpoint_abort_xfer(ep); // abort any pending transfer
+  }
+  ep->max_packet_size = ep_desc->wMaxPacketSize;
+
+  // enable endpoint
+  io_rw_32 *ep_reg = get_ep_ctrl(epnum, dir);
+  if (ep_reg != NULL) {
+    *ep_reg |= EP_CTRL_ENABLE_BITS;
+  }
+  return true;
+}
+
+void dcd_edpt_close_all(uint8_t rhport) {
+  (void) rhport;
+  // may need to use EP Abort
+  reset_non_control_endpoints();
+}
+
+bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes, bool is_isr) {
+  (void)rhport;
+  (void)is_isr;
+  const uint8_t    epnum = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir = tu_edpt_dir(ep_addr);
+
+  hw_endpoint_t *ep = hw_endpoint_get(epnum, dir);
+  io_rw_32      *ep_reg  = get_ep_ctrl(epnum, dir);
+  io_rw_32      *buf_reg = get_buf_ctrl(epnum, dir);
+  if (ep->state != EPSTATE_IDLE) {
+    // A clear-halt on an endpoint that isn't stalled keeps its transfer running (dcd_edpt_clear_stall()) while usbd
+    // frees the endpoint, so a class may arm the next transfer over it, e.g. MSC re-arming the CBW receive in Reset
+    // Recovery. Replace the old one, as other DCDs do: re-arming its buffers would panic in bufctrl_write32()
+    hw_endpoint_drop_xfer(ep, buf_reg);
+  }
+  rp2usb_xfer_start(ep, ep_reg, buf_reg, buffer, NULL, total_bytes);
+  return true;
+}
+
+#if CFG_TUD_EDPT_DEDICATED_HWFIFO
+bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t *ff, uint16_t total_bytes, bool is_isr) {
+  (void)rhport;
+  (void)is_isr;
+  hw_endpoint_t *ep = hw_endpoint_get(epnum, dir);
+  io_rw_32      *ep_reg  = get_ep_ctrl(epnum, dir);
+  io_rw_32      *buf_reg = get_buf_ctrl(epnum, dir);
+  rp2usb_xfer_start(ep, ep_reg, buf_reg, NULL, ff, total_bytes);
+  return true;
+}
+#endif
+
+bool dcd_edpt_abort_xfer(uint8_t rhport, uint8_t ep_addr) {
+  (void)rhport;
+  const uint8_t    epnum = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir   = tu_edpt_dir(ep_addr);
+  hw_endpoint_t   *ep    = hw_endpoint_get(epnum, dir);
+
+  if (ep->state != EPSTATE_IDLE) {
+    hw_endpoint_drop_xfer(ep, get_buf_ctrl(epnum, dir));
+  }
+  return true;
+}
+
+void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
+  (void)rhport;
+  const uint8_t    epnum = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir   = tu_edpt_dir(ep_addr);
+  hw_endpoint_t   *ep    = hw_endpoint_get(epnum, dir);
+
+  if (epnum == 0) {
+    // A stall on EP0 has to be armed so it can be cleared on the next setup packet
+    usb_hw_set->ep_stall_arm = (dir == TUSB_DIR_IN) ? USB_EP_STALL_ARM_EP0_IN_BITS : USB_EP_STALL_ARM_EP0_OUT_BITS;
+  }
+
+  // abort first then stall and clear current pending buffer
+  hw_endpoint_abort_xfer(ep);
+  io_rw_32 *buf_reg = get_buf_ctrl(epnum, dir);
+  *buf_reg          = USB_BUF_CTRL_STALL;
+}
+
+void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
+  const uint8_t    epnum = tu_edpt_number(ep_addr);
+  const tusb_dir_t dir   = tu_edpt_dir(ep_addr);
+
+  if (epnum != 0) {
+    struct hw_endpoint* ep = hw_endpoint_get(epnum, dir);
+
+    // Runs in task context (on the core that ran dcd_init, which owns USBCTRL_IRQ): disable all interrupts on this
+    // core so neither the E15 SOF arming nor BUFF_STATUS completion changes ep state, user_buf/remaining_len or
+    // buffer control between the state check, the abort, the drain, the snapshot and the re-issue. PRIMASK rather
+    // than the NVIC line, which would leave RTOS preemption on: a higher-priority task holding the CPU across a SOF
+    // would leave e15_last_sof stale, so the re-issue's E15 critical-period check could pass inside the real window.
+    // Nothing in the section sends an event: an ACTIVE/PENDING endpoint has future_len == 0 (rp2usb_xfer_start()
+    // consumes it before arming, rp2usb_xfer_continue() sets it only when completing the transfer), so the re-issue
+    // never completes inside rp2usb_xfer_start(); a completion drained here is reported after the section.
+    const uint32_t irq_state = save_and_disable_interrupts();
+
+    bool     xfer_done = false; // a completion drained below finished the transfer
+    uint16_t done_len  = 0;
+
+    // An E15-deferred bulk IN (PENDING) is in flight too: one buffer may still be armed while the
+    // other waits for the SOF, and the hardware buffer selector already points past the sent one.
+    if (ep->state == EPSTATE_ACTIVE || ep->state == EPSTATE_PENDING) {
+      // Clear-halt on an endpoint with an in-flight transfer is used as a data-toggle reset
+      // (e.g. usbtest case 29) rather than to recover from a real stall (a stall aborts the
+      // transfer, leaving the endpoint IDLE). Abort and re-issue the transfer with the toggle
+      // reset to DATA0 so it still completes and releases the usbd claim, instead of silently
+      // dropping it and starving the endpoint.
+      // The re-issue starts from buffer 0 with the buffer selector reset, or defers to the SOF again.
+      const uint32_t ep_bit  = rp2usb_ep_bit(ep_addr);
+      io_rw_32      *ep_reg  = get_ep_ctrl(epnum, dir);
+      io_rw_32      *buf_reg = get_buf_ctrl(epnum, dir);
+
+      // Stop the endpoint before reading its state: with interrupts off, a buffer that completed since then (or
+      // completes before the abort takes effect) keeps its BUFF_STATUS bit pending, which the abort does not clear.
+      // Left there, the ISR would apply it to the re-issued transfer's freshly armed buffer once interrupts return.
+      // B0/B1 have no usable EP_ABORT (RP2040-E2): the drain below is best effort there, as a completion can still
+      // land between it and the buffer control reset, the same residual race the plain abort always had on B0/B1.
+      hw_endpoint_abort_begin(ep_bit);
+
+      // Account for those completions exactly as the ISR does (double-buffered re-sets the bit after a clear): count
+      // IN bytes sent, copy OUT data received. A re-armed buffer is ignored by the aborted controller and counted as
+      // staged below. A completion that finishes the transfer is latched like the ISR does (length, then reset to
+      // IDLE, so a second pending buffer hits the IDLE early return) and reported instead of re-issuing it.
+      while (usb_hw->buf_status & ep_bit) {
+        const uint8_t buf_id     = (usb_hw->buf_cpu_should_handle & ep_bit) ? 1 : 0; // before clear buf_status
+        usb_hw_clear->buf_status = ep_bit;
+        if (rp2usb_xfer_continue(ep, ep_reg, buf_reg, buf_id, dir == TUSB_DIR_OUT)) {
+          xfer_done = true;
+          done_len  = ep->xferred_len;
+          rp2usb_reset_transfer(ep);
+        }
+      }
+
+      if (xfer_done) {
+        // Nothing is armed after a completion; end like an IDLE endpoint's clear-halt: DATA0 for the next transfer
+        *buf_reg = 0;
+        hw_endpoint_abort_end(ep_bit);
+        ep->next_pid = 0;
+      } else {
+        // Save the buffer/length before resetting the transfer clears them.
+        uint8_t*       user_buf  = ep->user_buf;
+        uint16_t       remaining = ep->remaining_len;
+        const uint16_t xferred   = ep->xferred_len; // bytes already moved on this submission
+        // bufctrl_prepare16() subtracts each armed buffer's length from remaining_len when arming,
+        // for BOTH directions, before the host has drained (IN) or filled (OUT) it. The abort
+        // discards those still-armed buffers, so rewind remaining_len by their lengths or the re-issue
+        // is short by 1-2 packets. IN additionally advances user_buf as packets are copied into DPRAM,
+        // so its pointer must rewind too; OUT copies out only on completion, so its pointer is intact.
+        const uint32_t bc = *buf_reg;
+        uint16_t staged = 0;
+        for (uint8_t i = 0; i < 2; i++) {
+          const uint16_t half = (uint16_t)(bc >> (16u * i));
+          if (half & USB_BUF_CTRL_AVAIL) {
+            // OUT buffers are armed for a whole packet, the LAST one holds only rx_last_len of the transfer
+            const bool out_last = (dir == TUSB_DIR_OUT) && (half & USB_BUF_CTRL_LAST);
+            staged = (uint16_t)(staged + (out_last ? ep->rx_last_len : (half & USB_BUF_CTRL_LEN_MASK)));
+          }
+        }
+        remaining = (uint16_t)(remaining + staged);
+        if (dir == TUSB_DIR_IN) {
+          user_buf -= staged;
+        }
+
+        *buf_reg = 0; // clear buffer control
+        rp2usb_reset_transfer(ep);
+        hw_endpoint_abort_end(ep_bit);
+
+        ep->next_pid = 0; // DATA0
+        rp2usb_xfer_start(ep, ep_reg, buf_reg, user_buf, NULL, remaining);
+        // rp2usb_xfer_start() zeroes xferred_len; add back what the aborted transfer already moved so
+        // the eventual completion reports the full length, not just the post-clear-halt remainder.
+        ep->xferred_len += xferred;
+      }
+    } else {
+      ep->next_pid = 0; // reset data toggle
+      io_rw_32 *buf_reg = get_buf_ctrl(epnum, dir);
+      *buf_reg          = 0; // clear the stall response
+    }
+
+    restore_interrupts(irq_state);
+
+    // Reported only after interrupts are restored: a task-level event send may block or toggle the USB IRQ itself.
+    if (xfer_done) {
+      dcd_event_xfer_complete(rhport, ep_addr, done_len, XFER_RESULT_SUCCESS, false);
+    }
+  }
+}
+
+void __tusb_irq_path_func(dcd_int_handler)(uint8_t rhport) {
+  (void) rhport;
+  dcd_rp2040_irq();
+}
+
+#endif

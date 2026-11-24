@@ -881,7 +881,30 @@ static void make_sfn(uint8_t *sfn, const uint16_t *name, int n) {
     }
 }
 
-static int create_fat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, scan_t *sc, uint32_t size, fs_file_t *out) {
+// a new folder's cluster on FAT: zeros, then "." (itself) and ".." (its
+// parent; 0 for the root, on FAT32 too) in its first sector
+static int fat_dots(fs_t *fs, uint32_t first, uint32_t up) {
+    int r = zero_clus(fs, first);
+    if (r) return r;
+    uint8_t *b = w_buf;
+    memset(b, 0, 512);
+    if (fs->type == FS_FAT32 && up == fs->root_clus) up = 0;
+    for (int i = 0; i < 2; i++) {
+        uint8_t *e = b + i * 32;
+        const uint32_t c = i ? up : first;
+        memset(e, ' ', 11);
+        e[0] = '.';
+        if (i) e[1] = '.';
+        e[11] = FS_A_DIR;
+        st16(e + 14, FAT_TIME); st16(e + 16, FAT_DATE); st16(e + 18, FAT_DATE);
+        st16(e + 20, fs->type == FS_FAT32 ? c >> 16 : 0);
+        st16(e + 22, FAT_TIME); st16(e + 24, FAT_DATE);
+        st16(e + 26, c & 0xFFFF);
+    }
+    return put(fs, clus_lba(fs, first), b) ? FS_OK : FS_EIO;
+}
+
+static int create_fat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, scan_t *sc, uint32_t size, bool folder, fs_file_t *out) {
     int need = sc->need;
     int d = 1;                             // the short name's tail: the first digit not taken
     while (d <= 9 && sc->tails >> d & 1) d++;
@@ -889,7 +912,11 @@ static int create_fat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, s
     sc->sfn[7] = (uint8_t)('0' + d);
     uint32_t cbytes = 512u << fs->spc_shift, first;
     int r = room(fs, dir, parent, sc);
-    if (r || (r = fat_alloc(fs, (size + cbytes - 1) / cbytes, &first))) return r;
+    if (r) return r;
+    if (folder) {                          // one cluster: the FAT, then its contents, then (below) its entry
+        if ((r = fat_alloc(fs, 1, &first)) || (r = fat_dots(fs, first, dir->first_clus))) return r;
+    } else if (!size) first = 0;           // an empty file has no clusters
+    else if ((r = fat_alloc(fs, (size + cbytes - 1) / cbytes, &first))) return r;
     uint8_t *ents = w_ents;
     memset(ents, 0, sizeof w_ents);
     int nl = need - 1;
@@ -908,23 +935,28 @@ static int create_fat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, s
     }
     uint8_t *e = ents + nl * 32;
     memcpy(e, sc->sfn, 11);
-    e[11] = 0x20;                          // archive
+    e[11] = folder ? FS_A_DIR : 0x20;      // a folder, or archive
     st16(e + 14, FAT_TIME); st16(e + 16, FAT_DATE); st16(e + 18, FAT_DATE);
     st16(e + 20, fs->type == FS_FAT32 ? first >> 16 : 0);
     st16(e + 22, FAT_TIME); st16(e + 24, FAT_DATE);
     st16(e + 26, first & 0xFFFF);
     st32(e + 28, size);
     if ((r = put_entries(fs, sc->run, need, ents, false))) return r;
-    file_out(out, sc->name, sc->n, size, first, false, 0x20);
+    file_out(out, sc->name, sc->n, size, first, false, folder ? FS_A_DIR : 0x20);
     return FS_OK;
 }
 
-static int create_exfat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, scan_t *sc, uint32_t size, fs_file_t *out) {
+static int create_exfat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent, scan_t *sc, uint32_t size, bool folder, fs_file_t *out) {
     int need = sc->need;
     static uint16_t map[256];
     uint32_t cbytes = 512u << fs->spc_shift, first;
     int r = ex_meta(fs);
-    if (r || (r = upcase_map(fs, map)) || (r = room(fs, dir, parent, sc)) || (r = bmp_alloc(fs, (size + cbytes - 1) / cbytes, &first))) return r;
+    if (r || (r = upcase_map(fs, map)) || (r = room(fs, dir, parent, sc))) return r;
+    if (folder) {                          // one cluster of zeros (no "." or ".." on exFAT): the bitmap, then it
+        size = cbytes;
+        if ((r = bmp_alloc(fs, 1, &first)) || (r = zero_clus(fs, first))) return r;
+    } else if (!size) first = 0;           // an empty file has no clusters
+    else if ((r = bmp_alloc(fs, (size + cbytes - 1) / cbytes, &first))) return r;
     uint16_t hash = 0;
     for (int i = 0; i < sc->n; i++) {
         uint16_t u = sc->name[i] < 256 ? map[sc->name[i]] : sc->name[i];
@@ -936,10 +968,10 @@ static int create_exfat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent,
     uint8_t *f = ents, *st = ents + 32;
     f[0] = 0x85;
     f[1] = (uint8_t)(need - 1);
-    st16(f + 4, 0x20);
+    st16(f + 4, folder ? FS_A_DIR : 0x20);
     st32(f + 8, EX_STAMP); st32(f + 12, EX_STAMP); st32(f + 16, EX_STAMP);
     st[0] = 0xC0;
-    st[1] = 0x03;                          // allocation possible, no FAT chain
+    st[1] = size ? 0x03 : 0x01;            // allocation possible, no FAT chain (which needs a cluster)
     st[3] = (uint8_t)sc->n;
     st16(st + 4, hash);
     st64(st + 8, size);
@@ -955,11 +987,12 @@ static int create_exfat(fs_t *fs, const fs_file_t *dir, const fs_file_t *parent,
     }
     st16(f + 2, set_sum(ents, need));
     if ((r = put_entries(fs, sc->run, need, ents, true))) return r;
-    file_out(out, sc->name, sc->n, size, first, true, 0x20);
+    file_out(out, sc->name, sc->n, size, first, size != 0, folder ? FS_A_DIR : 0x20);
     return FS_OK;
 }
 
-int fs_create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32_t size, fs_file_t *out, bool *made) {
+enum { MAKE_FILE, MAKE_EMPTY, MAKE_FOLDER };
+static int create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32_t size, int what, fs_file_t *out, bool *made) {
     *made = false;
     if (n < 1 || n > 255) return FS_ENAME;
     for (int i = 0; i < n; i++)
@@ -977,16 +1010,29 @@ int fs_create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32
     int r = find_dir(fs, dirpath, &dir, &parent);
     if (r || (r = scan(fs, &dir, &sc))) return r;
     if (sc.found) {
-        if (sc.file.is_dir) return FS_ENAME;  // a folder of that name
+        if (!sc.file.is_dir != (what != MAKE_FOLDER)) return FS_ENAME;   // a folder of that name (or a file, for a folder)
         *out = sc.file;
         return FS_OK;
     }
-    if (!size) return FS_ENOFILE;
+    if (!size && what == MAKE_FILE) return FS_ENOFILE;
     if (!fs->write) return FS_ENOWRITE;
-    r = fs->type == FS_EXFAT ? create_exfat(fs, &dir, &parent, &sc, size, out) : create_fat(fs, &dir, &parent, &sc, size, out);
+    const bool folder = what == MAKE_FOLDER;
+    r = fs->type == FS_EXFAT ? create_exfat(fs, &dir, &parent, &sc, size, folder, out) : create_fat(fs, &dir, &parent, &sc, size, folder, out);
     if (!r) *made = true;
     return r;
     #undef sc
+}
+
+int fs_create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32_t size, fs_file_t *out, bool *made) {
+    return create(fs, dirpath, name, n, size, MAKE_FILE, out, made);
+}
+
+int fs_create_empty(fs_t *fs, const char *dirpath, const uint16_t *name, int n, fs_file_t *out, bool *made) {
+    return create(fs, dirpath, name, n, 0, MAKE_EMPTY, out, made);
+}
+
+int fs_mkdir(fs_t *fs, const char *dirpath, const uint16_t *name, int n, fs_file_t *out, bool *made) {
+    return create(fs, dirpath, name, n, 0, MAKE_FOLDER, out, made);
 }
 
 // ---- deleting a file

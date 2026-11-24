@@ -26,10 +26,28 @@
 #                                path: midihello's directory has another),
 #                                or with OWN_TUSB_CONFIG the plugin's own
 #                                (host, HID); USES usb-host
+#   cvcart_features(myplugin [PADS] [KEYBOARD] [MOUSE] [MIDI_IN] [MIDI_OUT]
+#                   [PSRAM] [CARD])
+#                                what the plugin uses, each a switch, before
+#                                cvcart_plugin(): the USB ones are cvusb.h
+#                                (instead of cvpad_use), PSRAM cvpsram_use,
+#                                CARD cvsd_use; and the .CVP's USES follow
+#                                (usb-host, usb-device, psram)
+#   cvfont_use(myplugin)         the 6x8 font with lower case (cvfont.h): 40
+#                                columns on a canvas (../midihello/vdp.h)
+#   cvedit_use(myplugin)         the text editor (cvedit.h), with cvfont_use;
+#                                the plugin also needs cvkernel_use (the
+#                                canvas) and the KEYBOARD and CARD features
 #   cvcart_plugin(nesinfo ID parrotcart.nesinfo NAME "NES Info" VERSION 1.0.0
-#                 [BY "Parrot Cart"] [HOME /NES] [OPENS .nes ...] [USES usb-host ...]
+#                 [BY "Parrot Cart"] [HOME /NES] [OPENS .nes ...] [USES usb-host standalone ...]
 #                 [ICON icon.txt] [FILE_ICON icon.txt] [FILE NESINFO.CVP] [HEAP]
 #                 [README README.md])
+#
+# USES: what the plugin uses (usb-host, usb-device, psram; cvcart_features
+# adds these), and standalone: the plugin opens files (OPENS) but can also
+# start with none, an empty page or a demo of its own. The menu lists it
+# with the plugins that open no files, which always start on their own.
+# Without it, a plugin with OPENS starts only with one of its files.
 #
 # README: the plugin's README, which its details page on the cart shows a
 # page at a time. Write ordinary Markdown: cvreadme.py turns it into the
@@ -151,6 +169,10 @@ endfunction()
 
 function(cvpad_use TARGET)
     cmake_parse_arguments(P "OWN_TUSB_CONFIG" "" "" ${ARGN})
+    get_target_property(features ${TARGET} CVCART_FEATURES)
+    if (features MATCHES "PADS|KEYBOARD|MOUSE|MIDI")
+        message(FATAL_ERROR "cvpad_use(${TARGET}) with cvcart_features()'s USB features: PADS there takes its place")
+    endif()
     target_sources(${TARGET} PRIVATE ${CVSDK_DIR}/cvpad.c ${CVSDK_DIR}/swpro.c ${CVSDK_DIR}/hidpad.c)
     if (NOT CVPAD_TINYUSB_VENDORED)
         # the pico-sdk's TinyUSB 0.18 (no cvpad_tinyusb.cmake): its hub
@@ -166,6 +188,115 @@ function(cvpad_use TARGET)
         target_include_directories(${TARGET} BEFORE PRIVATE ${CVSDK_DIR}/cvpad_tusb)
     endif()
     target_link_libraries(${TARGET} tinyusb_host hardware_timer)
+endfunction()
+
+# cvcart_features(TARGET feature ...): the switches (cvusb.h has the USB ones).
+#
+#   PADS KEYBOARD MOUSE MIDI_IN    the USB port a host (usb-host)
+#   MIDI_OUT                       the USB port a MIDI device on a computer (usb-device)
+#   PSRAM                          the 8 MB PSRAM: cvpsram_use (psram)
+#   CARD                           the SD card: cvsd_use
+#
+# For the USB features: cvusb.c and only the parts they need, TinyUSB from
+# sdk/tinyusb (cvpad_tinyusb.cmake, included before pico_sdk_import.cmake)
+# with cvusb_tusb/tusb_config.h, whose classes follow the CVUSB_* definitions
+# set here. Call it before cvcart_plugin(), which adds the USES it sets to
+# its own. It takes the place of cvpad_use() (the two can't be together).
+function(cvcart_features TARGET)
+    set(known PADS KEYBOARD MOUSE MIDI_IN MIDI_OUT PSRAM CARD)
+    cmake_parse_arguments(F "${known}" "" "" ${ARGN})
+    if (F_UNPARSED_ARGUMENTS)
+        string(REPLACE ";" " " known_s "${known}")
+        message(FATAL_ERROR "cvcart_features(${TARGET}): ${F_UNPARSED_ARGUMENTS}? The features are ${known_s}")
+    endif()
+    get_target_property(done ${TARGET} CVCART_PLUGIN)
+    if (done)
+        message(FATAL_ERROR "cvcart_features(${TARGET}) after cvcart_plugin(${TARGET}): it sets the plugin's USES, so it comes first")
+    endif()
+    get_target_property(had ${TARGET} CVCART_FEATURES)
+    if (had)
+        message(FATAL_ERROR "cvcart_features(${TARGET}) twice: name every feature in one call")
+    endif()
+    set(features)
+    set(uses)
+    set(usb_src)
+    foreach (f ${known})
+        if (F_${f})
+            list(APPEND features ${f})
+        endif()
+    endforeach()
+    set_property(TARGET ${TARGET} PROPERTY CVCART_FEATURES "${features};")
+    if (F_PADS OR F_KEYBOARD OR F_MOUSE OR F_MIDI_IN)
+        list(APPEND uses usb-host)
+    endif()
+    if (F_MIDI_OUT)
+        list(APPEND uses usb-device)
+    endif()
+    if (F_PSRAM)
+        list(APPEND uses psram)
+        cvpsram_use(${TARGET})
+    endif()
+    if (F_CARD)
+        cvsd_use(${TARGET})
+    endif()
+    if (F_PADS OR F_KEYBOARD OR F_MOUSE OR F_MIDI_IN OR F_MIDI_OUT)
+        if (NOT CVPAD_TINYUSB_VENDORED)
+            message(FATAL_ERROR "cvcart_features(${TARGET}): the USB features need the SDK's TinyUSB: "
+                "include(.../sdk/cvpad_tinyusb.cmake) before pico_sdk_import.cmake")
+        endif()
+        get_target_property(src ${TARGET} SOURCES)
+        if (src MATCHES "cvpad\\.c")
+            message(FATAL_ERROR "cvcart_features(${TARGET}): with cvpad_use() too; PADS takes its place")
+        endif()
+        list(APPEND usb_src ${CVSDK_DIR}/cvusb.c)
+        foreach (f PADS KEYBOARD MOUSE MIDI_IN MIDI_OUT)
+            if (F_${f})
+                target_compile_definitions(${TARGET} PRIVATE CVUSB_${f}=1)
+            endif()
+        endforeach()
+        if (F_PADS)
+            list(APPEND usb_src ${CVSDK_DIR}/cvpad.c ${CVSDK_DIR}/swpro.c ${CVSDK_DIR}/hidpad.c)
+            target_compile_definitions(${TARGET} PRIVATE CVUSB=1)    # cvpad.c's hooks for cvusb.c
+        endif()
+        if (F_KEYBOARD OR F_MOUSE)
+            list(APPEND usb_src ${CVSDK_DIR}/cvusb_keys.c)
+        endif()
+        if (F_MIDI_IN)
+            list(APPEND usb_src ${CVSDK_DIR}/cvusb_midih.c)
+        endif()
+        if (F_MIDI_OUT)
+            list(APPEND usb_src ${CVSDK_DIR}/cvusb_midid.c)
+        endif()
+        if (F_MIDI_IN OR F_MIDI_OUT)
+            list(APPEND usb_src ${CVSDK_DIR}/cvusb_midi.c)
+        endif()
+        target_sources(${TARGET} PRIVATE ${usb_src})
+        target_include_directories(${TARGET} BEFORE PRIVATE ${CVSDK_DIR}/cvusb_tusb)
+        target_include_directories(${TARGET} PRIVATE ${CVSDK_DIR})
+        target_link_libraries(${TARGET} pico_stdlib hardware_timer)
+        if (F_PADS OR F_KEYBOARD OR F_MOUSE OR F_MIDI_IN)
+            target_link_libraries(${TARGET} tinyusb_host)
+        endif()
+        if (F_MIDI_OUT)
+            target_link_libraries(${TARGET} tinyusb_device)
+        endif()
+    endif()
+    set_property(TARGET ${TARGET} PROPERTY CVCART_USES "${uses}")
+endfunction()
+
+function(cvfont_use TARGET)
+    get_target_property(src ${TARGET} SOURCES)
+    if (NOT src MATCHES "cvfont\\.c")
+        target_sources(${TARGET} PRIVATE ${CVSDK_DIR}/cvfont.c)
+    endif()
+    target_include_directories(${TARGET} PRIVATE ${CVSDK_DIR})
+endfunction()
+
+# the editor: its files come through fsro (cvsd_use, or cvcart_features CARD)
+function(cvedit_use TARGET)
+    cvfont_use(${TARGET})
+    target_sources(${TARGET} PRIVATE ${CVSDK_DIR}/cvedit.c)
+    target_include_directories(${TARGET} PRIVATE ${CVSDK_DIR})
 endfunction()
 
 function(cvkernel_use TARGET)
@@ -230,10 +361,22 @@ function(cvcart_plugin TARGET)
     if (P_OPENS)
         list(APPEND args --opens ${P_OPENS})
     endif()
+    # what cvcart_features() said, and what's given here
+    get_target_property(f_uses ${TARGET} CVCART_USES)
+    if (f_uses)
+        list(APPEND P_USES ${f_uses})
+        list(REMOVE_DUPLICATES P_USES)
+    endif()
     if (P_USES)
         string(REPLACE ";" "," uses "${P_USES}")
         list(APPEND args --uses ${uses})
     endif()
+    # a MIDI device's name on the computer: the plugin's (cvusb_midid.c)
+    get_target_property(features ${TARGET} CVCART_FEATURES)
+    if (features MATCHES "MIDI_OUT")
+        target_compile_definitions(${TARGET} PRIVATE "CVUSB_DEVICE_NAME=\"${P_NAME}\"")
+    endif()
+    set_property(TARGET ${TARGET} PROPERTY CVCART_PLUGIN TRUE)
     if (P_ICON)
         get_filename_component(icon ${P_ICON} ABSOLUTE)
         list(APPEND args --icon ${icon})

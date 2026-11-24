@@ -5,8 +5,9 @@
 //
 // Writing (the Game Boy's save files, the menu's plugin manager): overwrite
 // a file's sectors in place, make a new file in a folder (fs_create), which
-// adds a cluster to the folder when it is full, and delete a file
-// (fs_delete). Nothing is renamed, and a file never changes size.
+// adds a cluster to the folder when it is full, make a folder (fs_mkdir),
+// and delete a file (fs_delete). Nothing is renamed, and a file never
+// changes size.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -103,8 +104,14 @@ int fs_name16(fs_t *fs, const char *dirpath, uint32_t clus, uint16_t *name, int 
 // clusters are contiguous where the card has a run free (exFAT: only then).
 // A full folder gets a cluster more (FAT16's root can't). The FAT, the
 // bitmap and FSInfo are written before the directory entries, so a write
-// cut short leaves at worst clusters marked used that no file owns.
+// cut short leaves at worst clusters marked used that no file owns. (On FAT,
+// when the name's entries fall in two sectors of the folder, the cut can
+// come between them: long-name pieces with no file after them, which every
+// reader skips and fsck removes. textedit/test/run.sh meets both.)
 int fs_create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32_t size, fs_file_t *out, bool *made);
+// The same, but a file that isn't there is made empty: 0 bytes, no clusters
+// (a text editor's empty file).
+int fs_create_empty(fs_t *fs, const char *dirpath, const uint16_t *name, int n, fs_file_t *out, bool *made);
 // Delete the file `name` (matched as fs_create matches) in dirpath: FS_ENOFILE
 // if it isn't there, FS_ENAME if it's a folder. Its directory entries are
 // marked deleted first (FAT: 0xE5 in the short-name entry and every long-name
@@ -117,6 +124,13 @@ int fs_create(fs_t *fs, const char *dirpath, const uint16_t *name, int n, uint32
 // fs->dir. If it was the file fs_open() mapped, don't write through that map
 // after: it isn't told.
 int fs_delete(fs_t *fs, const char *dirpath, const uint16_t *name, int n);
+// The folder `name` in dirpath. If it is there, *out is it and *made false
+// (a file of that name: FS_ENAME). If not, it is made, empty, *made true: one
+// cluster, marked in the FAT or the bitmap first, then zeroed (FAT: with its
+// "." and ".." entries), then its entry written in dirpath. So a write cut
+// short leaves at worst a cluster marked used that nothing owns. FAT16's
+// top folder can't grow: FS_EFULL when it is full.
+int fs_mkdir(fs_t *fs, const char *dirpath, const uint16_t *name, int n, fs_file_t *out, bool *made);
 // sector sec of the file fs_open() opened: write buf there
 int fs_write_sec(fs_t *fs, uint32_t sec, const uint8_t *buf);
 

@@ -1,4 +1,9 @@
-commit 94ab2d7c52d229dadcbc428db15c222c2a7d1a48
-date   2026-11-18T12:25:13-08:00
-about  Every frame plugin on cvfserve.S, the two-sample bus loop
-copied 2026-11-18 by tools/update-sdk.sh
+commit 4070e7f2320edb5cbb7f6beb69817972331e0001
+date   2026-11-21T20:07:03-08:00
+about  Text Editor 0.1.2, Vectrex 0.1.6: USES standalone (they start with no file)
+copied 2026-11-23 by tools/update-sdk.sh
+
+also: back to the menu from the controllers (both fire buttons and * or
+a USB pad's Select and Start held for 2 s), in cvhome.h, cvkernel.c/.h,
+cvframes.c/.h and cvpad.c/.h, added by tools/add-home.py from the plugin
+template (https://github.com/plasticbugs/parrot-plugin-template)

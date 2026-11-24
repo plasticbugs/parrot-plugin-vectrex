@@ -37,8 +37,13 @@ typedef struct {
 void cvf_start(const cvf_config_t *c);
 
 // each pass of the plugin's loop: the power watch, and back to the menu
-// (it doesn't return then) after RESET or the console going off
+// (it doesn't return then) after RESET, the console going off, or both fire
+// buttons and * (a USB pad's Select and Start) held for 2 seconds (cvhome.h)
 void cvf_task(uint32_t now_us);
+
+// false: the fire buttons and * (Select and Start) held don't go back to the
+// menu, for a plugin whose game needs them held together (true again: they do)
+void cvf_home(bool on);
 
 // the menu's bottom line when the plugin goes back (at most 32 characters)
 void cvf_note(const char *note);

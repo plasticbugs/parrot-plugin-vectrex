@@ -31,6 +31,12 @@
 // The build: cvpad_use(target) in CMakeLists.txt (cvplugin.cmake). Its
 // TinyUSB configuration is sdk/cvpad_tusb/tusb_config.h, or the plugin's
 // own with cvpad_use(target OWN_TUSB_CONFIG).
+//
+// A new plugin uses cvusb.h instead (cvcart_features(target PADS ...)),
+// which has the pads and keyboards, mice and MIDI too. There this file is
+// built with CVUSB: cvusb owns the port and the timer, so cvpad_init(),
+// cvpad_task(), cvpad_stop(), cvpad_drop(), cvpad_set_tick() and
+// cvpad_task_max_us() aren't built, and cvusb_pad() is cvpad_get().
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -56,6 +62,11 @@ void cvpad_drop(void);
 // pad n's state (false while there's none in slot n, or it hasn't sent its
 // state yet: a Switch pad takes a moment to start)
 bool cvpad_get(int n, gamepad_t *p);
+
+// some pad holds all of these buttons (GP_*) now. Unlike cvpad_get() it
+// leaves the presses it latches alone: cvk_task() and cvf_task() look with
+// it for Select and Start (cvhome.h)
+bool cvpad_held(uint32_t buttons);
 
 // pads plugged in now (started or not)
 int cvpad_count(void);

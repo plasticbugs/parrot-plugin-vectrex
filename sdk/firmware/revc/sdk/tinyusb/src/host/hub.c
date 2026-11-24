@@ -36,7 +36,17 @@ typedef struct {
 
   uint8_t poll_failed_count; // consecutive failed status-change interrupt polls
   uint8_t recover_port;      // last status read by the recovery: 0 = hub, 1..bNbrPorts = port
+  uint16_t present;          // cvcart: ports (bit n = port n) found with a device at power-up and no change flagged
+  bool     ready;            // cvcart: configured: hub_poll() reads its ports
+  bool     busy;             // cvcart: a port's status change being read and handled (hub_poll() waits)
+  uint8_t  poll_port;        // cvcart: the port hub_poll() read last
+  uint32_t poll_at_ms;       // cvcart: when it reads the next
+  uint32_t busy_ms;          // cvcart: when busy was set
 } hub_interface_t;
+
+// cvcart: hub_poll() reads one port's status this often. A Genesys GL3523 (Anker) never answers its status
+// endpoint, so a device plugged into it, or pulled out, is seen only this way.
+#define HUB_POLL_MS 100
 
 typedef struct {
   TUH_EPBUF_DEF(status_change, 4); // interrupt endpoint
@@ -235,18 +245,42 @@ void hub_close(uint8_t dev_addr) {
   }
 }
 
-bool hub_edpt_status_xfer(uint8_t daddr) {
+// cvcart: what the status endpoint and hub_poll() see, for a diagnostic screen (Pad Test). Weak, does nothing by
+// default. what 1: the status endpoint answered (value = the result << 8 | its change bitmap); 2: a poll found a
+// change (value = the port << 16 | the port's change bits); 3: the status endpoint could not be armed; 4: a change
+// whose handling was dropped (its device gone part-way) was given up after a second.
+TU_ATTR_WEAK void tuh_hub_diag_cb(uint8_t daddr, uint8_t what, uint32_t value) {
+  (void) daddr; (void) what; (void) value;
+}
+
+// cvcart: the status endpoint armed, unless it already is: a change hub_poll() found ends with usbh or
+// process_new_status() asking for it again, while it may still be waiting from before
+static bool status_arm(uint8_t daddr) {
   hub_interface_t* p_hub = get_hub_itf(daddr);
   hub_epbuf_t* p_epbuf = get_hub_epbuf(daddr);
 
   TU_VERIFY(p_hub->ep_in != 0); // closed
-  TU_VERIFY(usbh_edpt_claim(daddr, p_hub->ep_in));
+  if (usbh_edpt_busy(daddr, p_hub->ep_in)) {
+    return true;
+  }
+  if (!usbh_edpt_claim(daddr, p_hub->ep_in)) {
+    tuh_hub_diag_cb(daddr, 3, 0);
+    return false;
+  }
   if (!usbh_edpt_xfer(daddr, p_hub->ep_in, p_epbuf->status_change, 1)) {
     usbh_edpt_release(daddr, p_hub->ep_in);
+    tuh_hub_diag_cb(daddr, 3, 1);
     return false;
   }
 
   return true;
+}
+
+// the end of a status change's handling, here or in usbh after an attached device's enumeration (cvcart: so
+// hub_poll() goes on too)
+bool hub_edpt_status_xfer(uint8_t daddr) {
+  get_hub_itf(daddr)->busy = false;
+  return status_arm(daddr);
 }
 
 //--------------------------------------------------------------------+
@@ -254,6 +288,11 @@ bool hub_edpt_status_xfer(uint8_t daddr) {
 //--------------------------------------------------------------------+
 static void config_set_port_power (tuh_xfer_t* xfer);
 static void config_port_power_complete (tuh_xfer_t* xfer);
+static void config_scan_start (uintptr_t param);
+static void config_scan_port (tuh_xfer_t* xfer);
+static void config_scan_cleared (tuh_xfer_t* xfer);
+static void config_scan_next (uint8_t daddr, uint8_t port);
+static void config_complete (uint8_t daddr);
 static void config_get_hub_descriptor(tuh_xfer_t* xfer);
 
 bool hub_set_config(uint8_t daddr, uint8_t itf_num) {
@@ -330,15 +369,110 @@ static void config_port_power_complete (tuh_xfer_t* xfer) {
   if (xfer->setup->wIndex == p_hub->bNbrPorts) {
     // All ports are power -> queue notification status endpoint and
     // complete the SET CONFIGURATION
-    if (!hub_edpt_status_xfer(daddr)) {
-      TU_MESS_FAILED();
-      TU_BREAKPOINT();
+    // cvcart: then read every port's status once (config_scan_port). A hub that was already powered, by its own
+    // charger, with a device on a port (a Genesys GL3523 does this) never names that port on its status endpoint, so
+    // the device is never seen. Linux and macOS read every port at a hub's start for the same reason, after the
+    // ports' power has had its bPwrOn2PwrGood time (at least 100 ms), and take any port with a device on it as new
+    // whatever its change flags say. So does this. It runs inside the hub's own enumeration, so no other control
+    // transfer can be under way. (Pad Test 0.1.3 read the ports straight after powering them and left a port whose
+    // connection change was flagged to the status endpoint: the pad was still missed.)
+    p_hub->present = 0;
+    uint32_t wait_ms = 2u * p_hub->bPwrOn2PwrGood_2ms;
+    if (wait_ms < 100) wait_ms = 100;
+    tuh_hub_scan_cb(daddr, 0, p_hub->bNbrPorts, (uint16_t) wait_ms);
+    if (!usbh_defer_func_ms_async(wait_ms, config_scan_start, daddr)) {
+      config_scan_start(daddr);     // (the deferred call's one slot was taken: read them now)
     }
-    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
   } else {
     // power next port
     uint8_t const hub_port = (uint8_t) (xfer->setup->wIndex + 1);
     hub_port_set_feature(daddr, hub_port, HUB_FEATURE_PORT_POWER, config_port_power_complete, 0);
+  }
+}
+
+// cvcart: what the scan found, for a diagnostic screen (Pad Test). port 0: the scan is about to start, status = the
+// number of ports, change = the wait in ms. Otherwise a port's status and change bits as read.
+TU_ATTR_WEAK void tuh_hub_scan_cb(uint8_t daddr, uint8_t port, uint16_t status, uint16_t change) {
+  (void) daddr; (void) port; (void) status; (void) change;
+}
+
+// cvcart: the ports' power has settled: read port 1 (then each in turn)
+static void config_scan_start (uintptr_t param) {
+  uint8_t const daddr = (uint8_t) param;
+  if (!tuh_connected(daddr)) {
+    return;                         // the hub went while its ports' power settled: its removal ends the enumeration
+  }
+  if (!hub_port_get_status(daddr, 1, NULL, config_scan_port, 0)) {
+    config_complete(daddr);
+  }
+}
+
+// cvcart: one port's status read at power-up. A device there is taken as new, as Linux does; a connection change
+// flagged on the port is cleared first, so the status endpoint doesn't name it again and start the device over.
+static void config_scan_port (tuh_xfer_t* xfer) {
+  uint8_t const daddr = xfer->daddr;
+  hub_interface_t* p_hub = get_hub_itf(daddr);
+  uint8_t const port = (uint8_t) tu_le16toh(xfer->setup->wIndex);
+
+  if (xfer->result == XFER_RESULT_SUCCESS && xfer->actual_len >= sizeof(hub_port_status_response_t) && port < 16) {
+    hub_port_status_response_t const* st = (hub_port_status_response_t const*) get_hub_epbuf(daddr)->ctrl_buf;
+    TU_LOG_DRV("HUB port %u at power-up: status %04x change %04x\r\n", port, st->status.value, st->change.value);
+    tuh_hub_scan_cb(daddr, port, st->status.value, st->change.value);
+    if (st->status.connection) {
+      p_hub->present |= (uint16_t) (1u << port);
+    }
+    if (st->change.connection &&
+        hub_port_clear_feature(daddr, port, HUB_FEATURE_PORT_CONNECTION_CHANGE, config_scan_cleared, 0)) {
+      return;
+    }
+  } else {
+    tuh_hub_scan_cb(daddr, port, 0xFFFF, 0xFFFF);      // (no answer)
+  }
+  config_scan_next(daddr, port);
+}
+
+static void config_scan_cleared (tuh_xfer_t* xfer) {
+  config_scan_next(xfer->daddr, (uint8_t) tu_le16toh(xfer->setup->wIndex));
+}
+
+// cvcart: the next port, or the end of the configuration
+static void config_scan_next (uint8_t daddr, uint8_t port) {
+  hub_interface_t* p_hub = get_hub_itf(daddr);
+  if (port < p_hub->bNbrPorts && hub_port_get_status(daddr, (uint8_t) (port + 1), NULL, config_scan_port, 0)) {
+    return;
+  }
+  config_complete(daddr);
+}
+
+// cvcart: the end of the hub's configuration. With devices found at power-up, each is attached as if its port had
+// been flagged, and the status endpoint is left unpolled as after STATE_CHECK_CONN: usbh polls it again during the
+// first device's enumeration (or when that fails), and enumerates the others in turn from its deferred attaches.
+static void config_complete (uint8_t daddr) {
+  hub_interface_t* p_hub = get_hub_itf(daddr);
+  uint16_t const present = p_hub->present;
+  p_hub->present = 0;
+
+  if (!present && !hub_edpt_status_xfer(daddr)) {
+    TU_MESS_FAILED();
+    TU_BREAKPOINT();
+  }
+  p_hub->ready      = true;
+  p_hub->poll_at_ms = tusb_time_millis_api() + HUB_POLL_MS;
+  usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+
+  for (uint8_t port = 1; port < 16; port++) {
+    if (present & (1u << port)) {
+      TU_LOG_DRV("HUB port %u: a device already there at power-up\r\n", port);
+      const hcd_event_t event = {
+        .rhport     = usbh_get_rhport(daddr),
+        .event_id   = HCD_EVENT_DEVICE_ATTACH,
+        .connection = {
+          .hub_addr = daddr,
+          .hub_port = port
+        }
+      };
+      hcd_event_handler(&event, false);
+    }
   }
 }
 
@@ -362,6 +496,14 @@ bool hub_xfer_cb(uint8_t daddr, uint8_t ep_addr, xfer_result_t result, uint32_t 
 
   bool processed = false; // true if new status is processed
   hub_interface_t* p_hub = get_hub_itf(daddr);
+
+  tuh_hub_diag_cb(daddr, 1, (uint32_t) result << 8 | get_hub_epbuf(daddr)->status_change[0]);
+  if (p_hub->busy) {
+    // cvcart: hub_poll() is reading a port, in ctrl_buf: the hub keeps a change until it is cleared, and names it
+    // again, or the next poll finds it
+    TU_ASSERT(status_arm(daddr));
+    return true;
+  }
 
   if (result == XFER_RESULT_SUCCESS) {
     p_hub->poll_failed_count = 0;
@@ -405,7 +547,10 @@ bool hub_xfer_cb(uint8_t daddr, uint8_t ep_addr, xfer_result_t result, uint32_t 
 
   // If new status event is processed: next status pool is queued by usbh.c after handled this request
   // Otherwise re-queue the status poll here
-  if (!processed) {
+  if (processed) {
+    p_hub->busy    = true; // cvcart
+    p_hub->busy_ms = tusb_time_millis_api();
+  } else {
     TU_ASSERT(hub_edpt_status_xfer(daddr));
   }
 
@@ -504,6 +649,59 @@ static void process_new_status(tuh_xfer_t* xfer) {
 
 // A multi-TT hub runs in its multi-TT alternate setting, with one transaction translator per downstream port. False
 // also when that setting is unknown: scheduling it as single-TT is conservative.
+//--------------------------------------------------------------------+
+// cvcart: reading the ports. A hub reports a change on its status endpoint, but a Genesys GL3523 (the Anker hubs)
+// never does: the stack missed every device plugged into it, and every one pulled out. So each port's status is
+// also read over EP0, one port every HUB_POLL_MS, and a change goes the way the status endpoint's would.
+//--------------------------------------------------------------------+
+static void poll_status_cb(tuh_xfer_t* xfer) {
+  const uint8_t daddr = xfer->daddr;
+  hub_interface_t* p_hub = get_hub_itf(daddr);
+  TU_VERIFY(p_hub->ep_in != 0,); // closed
+
+  const hub_port_status_response_t* st = get_port_status(daddr);
+  if (xfer->result == XFER_RESULT_SUCCESS && xfer->actual_len >= sizeof(hub_port_status_response_t) &&
+      (st->change.value & 0x1F) != 0) { // (bits 0-4 are the change bits)
+    tuh_hub_diag_cb(daddr, 2, (uint32_t) tu_le16toh(xfer->setup->wIndex) << 16 | st->change.value);
+    tuh_xfer_t as_reported = *xfer;
+    as_reported.user_data  = STATE_CLEAR_CHANGE; // as if the status endpoint had named the port
+    process_new_status(&as_reported);            // ends with hub_edpt_status_xfer(), here or in usbh
+    return;
+  }
+  p_hub->busy = false;
+}
+
+// called by usbh when its events are all handled
+void hub_poll(bool enumerating, bool quiet) {
+  const uint32_t now = tusb_time_millis_api();
+  for (uint8_t i = 0; i < CFG_TUH_HUB; i++) {
+    hub_interface_t* p_hub = &hub_itfs[i];
+    const uint8_t daddr = (uint8_t) (i + 1 + CFG_TUH_DEVICE_MAX);
+    if (!p_hub->ready || p_hub->ep_in == 0 || p_hub->bNbrPorts == 0 || enumerating) {
+      continue; // (an enumeration reads its port's status into ctrl_buf too)
+    }
+    if (p_hub->busy) {
+      // a change waits on a transfer or on an enumeration: with neither for a second, it was dropped
+      if (quiet && now - p_hub->busy_ms >= 1000) {
+        tuh_hub_diag_cb(daddr, 4, 0);
+        (void) hub_edpt_status_xfer(daddr);
+      }
+      continue;
+    }
+    if ((int32_t) (now - p_hub->poll_at_ms) < 0) {
+      continue;
+    }
+    p_hub->poll_at_ms = now + HUB_POLL_MS;
+    const uint8_t port = (uint8_t) (p_hub->poll_port % p_hub->bNbrPorts + 1);
+    if (hub_port_get_status(daddr, port, NULL, poll_status_cb, 0)) {
+      p_hub->poll_port = port;
+      p_hub->busy      = true;
+      p_hub->busy_ms   = now;
+    }
+  }
+}
+
+//--------------------------------------------------------------------+
 bool hub_tt_multi(uint8_t hub_addr) {
   TU_VERIFY(hub_addr > CFG_TUH_DEVICE_MAX && hub_addr <= CFG_TUH_DEVICE_MAX + CFG_TUH_HUB);
   return get_hub_itf(hub_addr)->mtt;

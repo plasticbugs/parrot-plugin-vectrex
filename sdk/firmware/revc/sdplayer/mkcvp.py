@@ -3,7 +3,7 @@
 
     mkcvp.py IN.uf2 OUT.cvp --id developer.name --name NAME --version 1.0.0
              [--by DEVELOPER] [--home /FOLDER] [--opens .ext ...]
-             [--uses usb-host,usb-device,psram] [--icon FILE] [--file-icon FILE]
+             [--uses usb-host,usb-device,psram,standalone] [--icon FILE] [--file-icon FILE]
              [--xip] [--readme README.md]
 
 IN is an RP2350 no_flash binary packaged with a relative load map: the .uf2
@@ -31,6 +31,12 @@ with its offset and length in the header at 280 and 284 (docs/plugins.md),
 so the image's SHA-256, and with it the cart's copy in flash, is the same
 with or without one.
 
+--uses standalone: the plugin opens files (--opens) but can also start
+with none, as the Text Editor does with an empty page. The menu then lists
+it with the plugins that open no files, which always run on their own, and
+A starts it. Without it, a plugin that opens files is started only with
+one.
+
 An icon FILE is 8 lines of 8 characters, '#' a pixel and '.' none, as in
 icons.h.
 """
@@ -49,7 +55,7 @@ for _d in (HERE, os.path.join(HERE, "..", "sdk")):     # cvreadme.py: beside thi
 
 HDR = 512
 API = 1                                    # plugins.h's CVP_API
-FLAGS = {"usb-host": 1, "usb-device": 2, "psram": 4}
+FLAGS = {"usb-host": 1, "usb-device": 2, "psram": 4, "standalone": 8}
 UF2_MAGIC = (0x0A324655, 0x9E5D5157, 0x0AB16F30)
 FAMILY_ABSOLUTE = 0xE48BFF57               # RP2350-E10's workaround block: not part of the image
 

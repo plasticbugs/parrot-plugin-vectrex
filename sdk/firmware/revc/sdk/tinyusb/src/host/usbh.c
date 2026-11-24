@@ -454,10 +454,9 @@ TU_ATTR_ALWAYS_INLINE static inline void usbh_device_close(uint8_t rhport, uint8
     // the next device must not inherit a spent one. enum_teardown() clears enumerating_daddr first, so its own closes
     // keep the budget.
     _usbh_data.root_retry_count = 0;
-    // clear enum delay function of the device being removed
-    if (_usbh_data.call_after.func == enum_delay_async) {
-      _usbh_data.call_after.func = NULL;
-    }
+    // clear enum delay function of the device being removed (cvcart: any deferred call: while a device enumerates the
+    // one slot is its own, also hub.c's wait for a new hub's port power)
+    _usbh_data.call_after.func = NULL;
   }
 
   // If this device has in-flight control xfer, complete as FAILED
@@ -944,6 +943,12 @@ static bool usbh_task_run(uint32_t timeout_ms, bool in_isr, bool stoppable) {
         if (ctrl_xfer_expired) {
           control_xfer_timeout_expired();
         }
+  #if CFG_TUH_HUB
+        // cvcart: every event handled: the hubs' ports are read (hub.c)
+        hub_poll(_usbh_data.enumerating_daddr != TUSB_INDEX_INVALID_8 || !osal_queue_empty(_usbh_daq),
+                 _usbh_data.ctrl_xfer_info.stage == CONTROL_STAGE_IDLE && tu_fifo_empty(&_usbh_pending_ctrl_q) &&
+                   _usbh_data.call_after.func == NULL);
+  #endif
         return false;
       }
       if (ctrl_xfer_expired) {

@@ -166,6 +166,20 @@ bool hub_port_get_status(uint8_t hub_addr, uint8_t hub_port, void *resp,
 // This does not send a request to the device
 bool hub_port_get_status_local(uint8_t hub_addr, uint8_t hub_port, hub_port_status_response_t* resp);
 
+// cvcart: called as the hub's start reads its ports (a diagnostic screen may define it): port 0 before the reads
+// (status = the number of ports, change = the wait for the ports' power in ms), then each port's status and change
+// bits (0xFFFF for both: no answer). Weak, does nothing by default.
+void tuh_hub_scan_cb(uint8_t daddr, uint8_t port, uint16_t status, uint16_t change);
+
+// cvcart: what the status endpoint and the port polls see (a diagnostic screen may define it; hub.c says what's
+// passed). Weak, does nothing by default.
+void tuh_hub_diag_cb(uint8_t daddr, uint8_t what, uint32_t value);
+
+// cvcart: usbh calls this when its events are handled: each hub's ports are read in turn, as a GL3523 never
+// reports a change on its status endpoint. enumerating: a device is being enumerated or waits to be; quiet: no
+// control transfer in flight or queued, and no deferred call.
+void hub_poll(bool enumerating, bool quiet);
+
 // Get status from Interrupt endpoint
 bool hub_edpt_status_xfer(uint8_t daddr);
 

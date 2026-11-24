@@ -13,6 +13,7 @@
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 
+#include "cvhome.h"
 #include "../sdplayer/perm.h"
 #include "../sdplayer/htrace.h"
 
@@ -276,6 +277,29 @@ void cvf_note_now(void) {
     if (cvl_ok(b)) cvl_return(b, note[0] ? note : NULL);
 }
 
+// ---- back to the menu from the controllers (cvhome.h) ----------------------------------
+bool cvpad_held(uint32_t buttons) __attribute__((weak));   // cvpad.c, if the plugin has USB pads
+static cvhome_t home;
+static bool home_off, home_forced;
+static uint32_t t_home;
+
+void cvf_home(bool on) { home_off = !on; }
+
+static void home_task(uint32_t t) {
+    if (!t_home) {
+        if (home_off) return;
+        const uint8_t fire = f_rep[1], key = f_rep[2];  // controller 1, as the kernel last read it (low = pressed)
+        const bool held = cvhome_console(!(fire & 1), !(fire & 2), key) || (cvpad_held && cvpad_held(CVHOME_PAD));
+        if (!cvhome_step(&home, t, held)) return;
+        t_home = t | 1;
+        fixed_ram[bindex(CVHOME_NMI - 0x8000)] = perm_lut[0xC7];    // the next NMI restarts the BIOS
+        ht_mark(HT_Y_BOOT, t, HM_RESET, 1);
+    } else if (!home_forced && t - t_home > CVHOME_FORCE_US) {
+        home_forced = true;                 // no NMI: RST 0 wherever it runs; the header stays 55 AA
+        for (uint32_t a = 2; a < BANK; a++) fixed_ram[bindex(a)] = perm_lut[0xC7];
+    }
+}
+
 static uint32_t t_menu;
 static bool titled;
 
@@ -286,7 +310,10 @@ void cvf_task(uint32_t t) {
         ht_mark(HT_Y_RESET, t, HM_RESET, 0);
     }
     if (console_off) to_menu_now(1);
-    if (!t_menu) return;
+    if (!t_menu) {
+        if (driving) home_task(t);
+        return;
+    }
     int32_t since = (int32_t)(t - t_menu);
     if (parked) {
         ht_mark(HT_Y_RESET, t, HM_PARKED, 0);

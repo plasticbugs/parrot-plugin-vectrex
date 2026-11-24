@@ -19,7 +19,7 @@ On the ColecoVision controller:
 - Left fire: button 3
 - Right fire: button 4
 - Keypad 0: the picture's colour
-- RESET on the console: back to the menu
+- RESET on the console, or both fire buttons and \* held for 2 seconds (Select and Start on a USB pad): back to the menu
 
 On a USB pad:
 

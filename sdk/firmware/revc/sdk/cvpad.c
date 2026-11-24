@@ -13,6 +13,19 @@
 #include "hidpad.h"
 #include "swpro.h"
 
+#ifdef CVUSB
+// Built into cvusb (cvusb.h, cvcart_features(... PADS)), which owns the
+// port, its timer and TinyUSB's HID callbacks: these three are the pads'
+// share of the callbacks, which cvusb.c passes every HID interface that
+// isn't a keyboard's or a mouse's, and cvpad_poll() is the pads' share of
+// the task. cvpad_init() and the rest of the port's life are cvusb's then,
+// and aren't built here.
+#include "cvusb_pvt.h"
+#define tuh_hid_mount_cb           cvpad_hid_mount_cb
+#define tuh_hid_umount_cb          cvpad_hid_umount_cb
+#define tuh_hid_report_received_cb cvpad_hid_report_received_cb
+#endif
+
 #define STICK_DIR 820                   // of GP_STICK_MAX (2047): a direction held past ~40%
 #define TICK_US   1000                  // the pads' task runs this often, from a timer
 
@@ -27,14 +40,18 @@ typedef struct {
 } slot_t;
 
 static slot_t pads[CVPAD_MAX];
+#ifndef CVUSB
 static uint32_t task_max_us;            // the longest run of the task so far
+#endif
 static bool seen;                       // a pad has been in a slot
 static void (*log_fn)(const char *line);
+#ifndef CVUSB
 static void (*tick_fn)(void);
 #if TUSB_VERSION_NUMBER >= 2100
 static repeating_timer_t timer;
 #endif
 static bool timer_on;
+#endif
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void say(const char *fmt, ...) {
@@ -138,6 +155,22 @@ static bool send(void *ctx, uint8_t id, const uint8_t *data, uint16_t len) {
     return false;
 }
 
+// The pads' share of the task: the Switch pads' start, and receives that
+// were refused, asked for again.
+static inline __attribute__((always_inline)) void pads_task(uint32_t t) {
+    for (int n = 0; n < CVPAD_MAX; n++) {
+        slot_t *s = &pads[n];
+        if (s->driver == CVPAD_SWITCH) swpro_task(&s->sw, t, send, s);
+        // a receive that was refused (the endpoint still claimed): again
+        if (s->driver != CVPAD_NONE && s->info.rearm_failed != s->info.rearmed &&
+            tuh_hid_receive_report(s->daddr, s->idx))
+            s->info.rearmed = s->info.rearm_failed;
+    }
+}
+
+#ifdef CVUSB
+void cvpad_poll(uint32_t now_us) { pads_task(now_us); }
+#else
 // The task: TinyUSB's events, an enumeration's next step, the Switch pads'
 // start. Nothing in it waits (sdk/tinyusb's TinyUSB defers an enumeration's
 // delays; the pico-sdk's 0.18 sleeps through them, 450 ms at a time).
@@ -150,14 +183,7 @@ static void task(void) {
     // each time a report and the task meet (NES 0.4.3 and 0.4.4 did that:
     // "NO REPORTS FOR 1 S" a moment after READY, for ever).
     const uint32_t t = time_us_32();
-    for (int n = 0; n < CVPAD_MAX; n++) {
-        slot_t *s = &pads[n];
-        if (s->driver == CVPAD_SWITCH) swpro_task(&s->sw, t, send, s);
-        // a receive that was refused (the endpoint still claimed): again
-        if (s->driver != CVPAD_NONE && s->info.rearm_failed != s->info.rearmed &&
-            tuh_hid_receive_report(s->daddr, s->idx))
-            s->info.rearmed = s->info.rearm_failed;
-    }
+    pads_task(t);
     if (tick_fn) tick_fn();
     const uint32_t us = time_us_32() - t0;
     if (us > task_max_us) task_max_us = us;
@@ -211,12 +237,15 @@ void cvpad_task(void) {
 }
 
 uint32_t cvpad_task_max_us(void) { return task_max_us; }
+#endif
 
 bool cvpad_seen(void) { return seen; }
 
 void cvpad_set_log(void (*fn)(const char *line)) { log_fn = fn; }
 
+#ifndef CVUSB
 void cvpad_set_tick(void (*fn)(void)) { tick_fn = fn; }
+#endif
 
 bool cvpad_get(int n, gamepad_t *p) {
     if (n < 0 || n >= CVPAD_MAX) return false;
@@ -231,6 +260,19 @@ bool cvpad_get(int n, gamepad_t *p) {
     }
     restore_interrupts(irq);
     return ok;
+}
+
+bool cvpad_held(uint32_t buttons) {
+    bool held = false;
+    const uint32_t irq = save_and_disable_interrupts();
+    for (int n = 0; n < CVPAD_MAX && !held; n++) {
+        const slot_t *s = &pads[n];
+        if (s->driver == CVPAD_NONE || !s->live) continue;
+        const uint32_t b = s->driver == CVPAD_SWITCH ? s->sw.pad.buttons : s->hp.pad.buttons;
+        held = (b & buttons) == buttons;
+    }
+    restore_interrupts(irq);
+    return held;
 }
 
 bool cvpad_info(int n, cvpad_info_t *out) {

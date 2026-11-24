@@ -10,6 +10,7 @@
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 
+#include "cvhome.h"
 #include "cvlaunch.h"
 #include "../sdplayer/htrace.h"
 #include "../midihello/mailbox.h"
@@ -239,6 +240,44 @@ static void __attribute__((noreturn)) to_menu_now(uint32_t why) {
     for (;;) tight_loop_contents();
 }
 
+// ---- back to the menu from the controllers (cvhome.h) ----------------------------------
+bool cvpad_held(uint32_t buttons) __attribute__((weak));   // cvpad.c, if the plugin has USB pads
+static cvhome_t home;
+static bool home_off, home_forced;
+static uint32_t t_home;
+
+void cvk_home(bool on) { home_off = !on; }
+
+// the kernel's last report of a kind, A0-A5 (cvk_report()'s bits), without taking it
+static uint8_t report_bits(uint32_t k) {
+    const uint32_t in = report[k];
+    uint8_t a = 0;
+    for (uint l = 0; l < 6; l++) if (in >> line_gpio[l] & 1) a |= (uint8_t)(1u << l);
+    return a;
+}
+
+// controller 1: the joystick report's A4 is the left fire, the keypad's the
+// right one (low = pressed), the keypad's A0-A3 its lines
+static bool console_held(void) {
+    if (!report_n[REPORT_KIND_JOY] || !report_n[REPORT_KIND_KEY]) return false;
+    const uint8_t j = report_bits(REPORT_KIND_JOY), k = report_bits(REPORT_KIND_KEY);
+    return cvhome_console(!(j & 0x10), !(k & 0x10), k);
+}
+
+static void home_task(uint32_t t) {
+    if (!t_home) {
+        if (home_off) return;
+        const bool held = console_held() || (cvpad_held && cvpad_held(CVHOME_PAD));
+        if (!cvhome_step(&home, t, held)) return;
+        t_home = t | 1;
+        rom_ram[findex(CVHOME_NMI - 0x8000)] = perm_lut[0xC7];  // the next NMI restarts the BIOS
+        ht_mark(HT_Y_BOOT, t, HM_RESET, 1);
+    } else if (!home_forced && t - t_home > CVHOME_FORCE_US) {
+        home_forced = true;                 // no NMI: RST 0 wherever it runs; the header stays 55 AA
+        for (uint32_t a = 2; a < sizeof rom_ram; a++) rom_ram[findex(a)] = perm_lut[0xC7];
+    }
+}
+
 static uint32_t t_menu;
 static bool titled;
 
@@ -249,7 +288,10 @@ void cvk_task(uint32_t t) {
         ht_mark(HT_Y_RESET, t, HM_RESET, 0);
     }
     if (console_off) to_menu_now(1);
-    if (!t_menu) return;
+    if (!t_menu) {
+        if (driving) home_task(t);
+        return;
+    }
     int32_t since = (int32_t)(t - t_menu);
     if (parked) {
         ht_mark(HT_Y_RESET, t, HM_PARKED, 0);
